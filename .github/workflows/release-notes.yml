@@ -1,113 +1,86 @@
 # .github/workflows/release-notes.yml
 #
-# PURPOSE
-# ───────
-# Today, step 9.4 of the JFrog CLI release process says:
-#   "Click on Auto-generate release notes"
-# GitHub's built-in generator only sees commits in jfrog-cli itself.
-# Changes in jfrog-cli-artifactory, jfrog-cli-security, jfrog-cli-core,
-# jfrog-client-go, build-info-go, and gofrog — which are pinned as Go
-# pseudo-versions in go.mod — are completely invisible.
+# Fires when a GitHub Release is published (step 9.6 of the release process).
+# Rewrites the release body with a full cross-repo changelog by diffing go.mod
+# between the previous and new release tags, then fetching merged PRs from all
+# downstream JFrog modules that changed.
 #
-# This workflow fires the moment a GitHub Release is published (step 9.6)
-# and rewrites the release body with a full cross-repo changelog.
-#
-# SETUP (one-time)
-# ────────────────
-# 1. Copy this file to .github/workflows/release-notes.yml in jfrog-cli
-# 2. No secrets needed — GITHUB_TOKEN has read access to all public jfrog/* repos
-# 3. That's it. Next release will auto-populate.
-#
-# MANUAL BACKFILL
-# ───────────────
-# Actions → "Cross-Repo Release Notes" → Run workflow
-# Fill in from_tag and to_tag to regenerate notes for any past release.
+# Manual backfill:
+#   Actions → Cross-Repo Release Notes → Run workflow → supply from/to tags
 
 name: Cross-Repo Release Notes
 
 on:
   release:
-    types: [published]       # Fires at step 9.6 "Publish release"
-
-  workflow_dispatch:         # Manual backfill for past releases
+    types: [published]
+  workflow_dispatch:
     inputs:
       from_tag:
-        description: "Previous release tag  (e.g. v2.85.0)"
+        description: "Previous release tag (e.g. v2.85.0)"
         required: true
       to_tag:
-        description: "New release tag  (e.g. v2.86.0)"
+        description: "New release tag (e.g. v2.86.0)"
         required: true
       update_release_body:
-        description: "Overwrite the GitHub Release body with generated notes?"
+        description: "Overwrite the GitHub Release body?"
         type: boolean
         default: true
 
 jobs:
   aggregate-release-notes:
-    name: Aggregate & Publish
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # Update GitHub Release body
-      pull-requests: read   # Read PR metadata from downstream repos
+      contents: write
+      pull-requests: read
 
     steps:
-
-      # ── 1. Checkout with full tag history ─────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── 2. Resolve which tags we are comparing ────────────────────────────
       - name: Resolve tags
         id: tags
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
             TO="${{ github.event.release.tag_name }}"
-            # Find the immediately preceding release tag
             FROM=$(git tag --sort=-version:refname \
                    | grep -v "^${TO}$" \
                    | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" \
                    | head -1)
-            if [ -z "$FROM" ]; then
-              echo "⚠️  No previous semver tag found — using first commit"
-              FROM=$(git rev-list --max-parents=0 HEAD)
-            fi
+            [ -z "$FROM" ] && FROM=$(git rev-list --max-parents=0 HEAD)
           else
             FROM="${{ inputs.from_tag }}"
             TO="${{ inputs.to_tag }}"
           fi
           echo "from=$FROM" >> $GITHUB_OUTPUT
           echo "to=$TO"     >> $GITHUB_OUTPUT
-          echo "from_tag=$FROM  →  to_tag=$TO"
+          echo "from=$FROM  to=$TO"
 
-      # ── 3. Python + dependencies (no pip install needed — stdlib only) ────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 4. Write the aggregator script inline ─────────────────────────────
-      #
-      #   We embed the script here so the workflow is fully self-contained.
-      #   No extra file needs to be committed to the repo.
-      #
-      - name: Write aggregator script
+      - name: Generate cross-repo release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FROM_TAG: ${{ steps.tags.outputs.from }}
+          TO_TAG:   ${{ steps.tags.outputs.to }}
+          MAIN_REPO: "jfrog/jfrog-cli"
         run: |
-          cat > /tmp/aggregate.py << 'PYEOF'
+          python3 << 'PYEOF'
           import os, re, sys, json, base64
           from datetime import datetime
           from collections import defaultdict
           from urllib.request import urlopen, Request
           from urllib.error import HTTPError
-          from urllib.parse import urlencode
 
-          TOKEN   = os.environ["GITHUB_TOKEN"]
-          FROM    = os.environ["FROM_TAG"]
-          TO      = os.environ["TO_TAG"]
-          REPO    = os.environ.get("MAIN_REPO", "jfrog/jfrog-cli")
+          TOKEN    = os.environ["GITHUB_TOKEN"]
+          FROM     = os.environ["FROM_TAG"]
+          TO       = os.environ["TO_TAG"]
+          REPO     = os.environ["MAIN_REPO"]
 
-          # ── All JFrog modules tracked in go.mod ─────────────────────────────
           MODULES = {
               "github.com/jfrog/jfrog-cli-artifactory": "jfrog/jfrog-cli-artifactory",
               "github.com/jfrog/jfrog-cli-security":    "jfrog/jfrog-cli-security",
@@ -128,39 +101,36 @@ jobs:
           }
 
           CATEGORIES = {
-              "breaking": ("⚠️  Breaking Changes",  0),
-              "security": ("🔒 Security Fixes",     1),
-              "feat":     ("✨ New Features",        2),
-              "fix":      ("🐛 Bug Fixes",           3),
-              "perf":     ("⚡ Performance",         4),
-              "docs":     ("📚 Documentation",       5),
-              "chore":    ("🔧 Internal Changes",    6),
-              "other":    ("📦 Other Changes",       7),
+              "breaking": ("⚠️  Breaking Changes", 0),
+              "security": ("🔒 Security Fixes",    1),
+              "feat":     ("✨ New Features",       2),
+              "fix":      ("🐛 Bug Fixes",          3),
+              "perf":     ("⚡ Performance",        4),
+              "docs":     ("📚 Documentation",      5),
+              "chore":    ("🔧 Internal Changes",   6),
+              "other":    ("📦 Other Changes",      7),
           }
 
-          PSEUDO_RE = re.compile(r"v\d+\.\d+\.\d+-\d{14}-([0-9a-f]{7,40})")
           SEMVER_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 
-          # ── GitHub API (stdlib urllib — zero dependencies) ──────────────────
-          def api(path, accept="application/vnd.github+json"):
-              url = f"https://api.github.com{path}"
-              req = Request(url, headers={
-                  "Authorization": f"Bearer {TOKEN}",
-                  "Accept": accept,
-                  "X-GitHub-Api-Version": "2022-11-28",
-              })
+          # ── GitHub API ───────────────────────────────────────────────────────
+          def api(path):
+              req = Request(
+                  f"https://api.github.com{path}",
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  }
+              )
               try:
                   with urlopen(req) as r:
                       return json.loads(r.read())
               except HTTPError as e:
-                  if e.code == 404:
-                      return None
-                  raise
+                  return None if e.code in (404, 422) else (_ for _ in ()).throw(e)
 
           def api_paged(path):
-              """Fetch all pages of a list endpoint."""
-              results = []
-              url = f"https://api.github.com{path}"
+              results, url = [], f"https://api.github.com{path}"
               while url:
                   req = Request(url, headers={
                       "Authorization": f"Bearer {TOKEN}",
@@ -174,84 +144,63 @@ jobs:
                               results.extend(data)
                           else:
                               return data
-                          # Parse Link header for next page
                           link = r.headers.get("Link", "")
-                          nxt = re.search(r'<([^>]+)>;\s*rel="next"', link)
-                          url = nxt.group(1) if nxt else None
+                          nxt  = re.search(r'<([^>]+)>;\s*rel="next"', link)
+                          url  = nxt.group(1) if nxt else None
                   except HTTPError as e:
-                      if e.code in (404, 422):
-                          break
+                      if e.code in (404, 422): break
                       raise
               return results
 
-          # ── go.mod helpers ──────────────────────────────────────────────────
+          # ── go.mod helpers ───────────────────────────────────────────────────
           def fetch_gomod(repo, ref):
               data = api(f"/repos/{repo}/contents/go.mod?ref={ref}")
-              if not data:
-                  return ""
-              return base64.b64decode(data["content"]).decode()
+              return base64.b64decode(data["content"]).decode() if data else ""
 
           def parse_gomod(text):
-              vers = {}
-              in_req = False
+              vers, in_req = {}, False
               for line in text.splitlines():
-                  # Strip ALL whitespace including tabs — go.mod uses tabs for indentation
                   s = line.strip()
-                  if not s or s.startswith("//"):
-                      continue
-                  if s.startswith("require ("):
-                      in_req = True; continue
-                  if in_req and s == ")":
-                      in_req = False; continue
+                  if not s or s.startswith("//"): continue
+                  if s.startswith("require ("):  in_req = True;  continue
+                  if in_req and s == ")":         in_req = False; continue
                   if in_req or s.startswith("require "):
-                      s = s.replace("require ", "").strip()
-                      # Remove inline comments
-                      s = s.split("//")[0].strip()
+                      s = s.replace("require ", "").split("//")[0].strip()
                       parts = s.split()
-                      if len(parts) >= 2:
-                          mod_path = parts[0].strip()
-                          version  = parts[1].strip()
-                          if mod_path in MODULES:
-                              vers[mod_path] = version
+                      if len(parts) >= 2 and parts[0] in MODULES:
+                          vers[parts[0]] = parts[1].strip()
               return vers
 
           def extract_hash(version):
               version = version.strip()
-              # Regular semver tag like v1.26.2 — use as git tag directly
               if SEMVER_RE.match(version):
                   return version, "tag"
-              # Go pseudo-version: vX.Y.Z-0.YYYYMMDDHHMMSS-COMMITHASH
-              # Split on '-' and take the last segment as the commit hash
               parts = version.split("-")
               if len(parts) >= 3:
                   candidate = parts[-1]
-                  # Validate it looks like a hex hash (7-40 chars)
                   if all(c in "0123456789abcdef" for c in candidate) and 7 <= len(candidate) <= 40:
                       return candidate, "pseudo"
-              print(f"    ⚠  extract_hash failed on: {repr(version)}", flush=True)
               return None, "unknown"
 
           def resolve_sha(repo, ref, ref_type):
-              if ref_type == "tag":
-                  d = api(f"/repos/{repo}/git/ref/tags/{ref}")
-                  if not d:
-                      return ref
-                  sha = d["object"]["sha"]
-                  if d["object"]["type"] == "tag":
-                      t = api(f"/repos/{repo}/git/tags/{sha}")
-                      return t["object"]["sha"]
-                  return sha
-              return ref  # already a SHA
+              if ref_type != "tag":
+                  return ref
+              d = api(f"/repos/{repo}/git/ref/tags/{ref}")
+              if not d: return ref
+              sha = d["object"]["sha"]
+              if d["object"]["type"] == "tag":
+                  t = api(f"/repos/{repo}/git/tags/{sha}")
+                  return t["object"]["sha"]
+              return sha
 
-          # ── PR collection ───────────────────────────────────────────────────
+          # ── PR collection ────────────────────────────────────────────────────
           def prs_between(repo, old_ref, new_ref, old_type, new_type):
               old_sha = resolve_sha(repo, old_ref, old_type)
               new_sha = resolve_sha(repo, new_ref, new_type)
-              print(f"  {repo}: comparing {old_sha[:12]}...{new_sha[:12]}", flush=True)
+              print(f"  {repo}: {old_sha[:12]}...{new_sha[:12]}", flush=True)
 
               cmp = api(f"/repos/{repo}/compare/{old_sha}...{new_sha}")
               if not cmp or "commits" not in cmp:
-                  print(f"    ⚠  compare failed", flush=True)
                   return []
 
               commits = cmp["commits"]
@@ -259,11 +208,10 @@ jobs:
               results, seen = [], set()
 
               for c in commits:
-                  sha  = c["sha"]
-                  msg  = c["commit"]["message"]
-                  first_line = msg.split("\n")[0]
+                  sha       = c["sha"]
+                  first_line = c["commit"]["message"].split("\n")[0]
 
-                  # Skip pure dep-bump commits from the main repo
+                  # Skip dep-bump commits in the main repo
                   if repo == REPO and re.search(r"\bbump\b", first_line, re.I):
                       continue
 
@@ -271,225 +219,153 @@ jobs:
                   if pr_list:
                       for pr in pr_list:
                           n = pr["number"]
-                          if n in seen or not pr.get("merged_at"):
-                              continue
+                          if n in seen or not pr.get("merged_at"): continue
                           seen.add(n)
                           results.append({
-                              "number":  n,
-                              "title":   pr["title"],
-                              "url":     pr["html_url"],
-                              "author":  pr["user"]["login"],
-                              "labels":  [l["name"] for l in pr.get("labels", [])],
-                              "repo":    repo,
-                              "sha":     sha[:12],
-                          })
-                  else:
-                      # Direct commit — include if not a merge/bump
-                      if not first_line.startswith("Merge ") and \
-                         not re.search(r"\bbump\b", first_line, re.I):
-                          results.append({
-                              "number": None,
-                              "title":  first_line,
-                              "url":    f"https://github.com/{repo}/commit/{sha}",
-                              "author": c["commit"]["author"]["name"],
-                              "labels": [],
+                              "number": n,
+                              "title":  pr["title"],
+                              "url":    pr["html_url"],
+                              "author": pr["user"]["login"],
+                              "labels": [l["name"] for l in pr.get("labels", [])],
                               "repo":   repo,
                               "sha":    sha[:12],
                           })
+                  elif not first_line.startswith("Merge ") and \
+                       not re.search(r"\bbump\b", first_line, re.I):
+                      results.append({
+                          "number": None,
+                          "title":  first_line,
+                          "url":    f"https://github.com/{repo}/commit/{sha}",
+                          "author": c["commit"]["author"]["name"],
+                          "labels": [],
+                          "repo":   repo,
+                          "sha":    sha[:12],
+                      })
               return results
 
-          # ── Categorise ──────────────────────────────────────────────────────
+          # ── Categorise ───────────────────────────────────────────────────────
           def categorise(pr):
               title  = pr["title"].lower()
               labels = " ".join(pr["labels"]).lower()
-              for kw, cat in [("breaking", "breaking"), ("security", "security"),
-                               ("bug", "fix"), ("enhancement", "feat"),
-                               ("feature", "feat"), ("perf", "perf")]:
-                  if kw in labels:
-                      return cat
-              for prefix in ["breaking", "security", "feat", "fix", "perf", "docs", "chore"]:
-                  if re.match(rf"^{prefix}[\s:(!\[]", title):
-                      return prefix
+
+              # Check GitHub labels first — most reliable signal
+              for kw, cat in [("breaking","breaking"),("security","security"),
+                               ("bug","fix"),("enhancement","feat"),
+                               ("feature","feat"),("perf","perf")]:
+                  if kw in labels: return cat
+
+              # Conventional commit prefix  e.g. "feat:", "fix(scope):", "fix!:"
+              for prefix in ["breaking","security","feat","fix","perf","docs","chore"]:
+                  if re.match(rf"^{prefix}[\s:(!\[]", title): return prefix
+
+              # Natural English patterns used in JFrog repos
+              # Fix patterns
+              if re.match(r"^(fix|fixed|fixes|bug|bugfix|hotfix|resolve|resolves)\b", title):
+                  return "fix"
+              # Feature / add patterns
+              if re.match(r"^(add|added|adds|new|feat|feature|support|implement|introduce)\b", title):
+                  return "feat"
+              # Update / chore patterns
+              if re.match(r"^(update|upgrade|bump|chore|refactor|cleanup|clean up|improve|improvement|revert)\b", title):
+                  return "chore"
+              # Ticket prefixes like "RTECO-839 - Fix ..."
+              ticket = re.match(r"^[a-z]+-\d+\s*[-:]\s*(.+)", title)
+              if ticket:
+                  return categorise({**pr, "title": ticket.group(1), "labels": pr["labels"]})
+
               return "other"
 
-          # ── Render markdown ─────────────────────────────────────────────────
+          # ── Render ───────────────────────────────────────────────────────────
           def render(from_tag, to_tag, all_prs, changed, skipped):
-              lines = []
-              date = datetime.utcnow().strftime("%Y-%m-%d")
-              lines += [
+              lines = [
                   f"## What changed in {to_tag}",
                   f"",
-                  f"> Auto-generated from {len(changed)+1} repositories · {date}  ",
+                  f"> Auto-generated from {len(changed)+1} repositories · {datetime.utcnow().strftime('%Y-%m-%d')}  ",
                   f"> Comparing `{from_tag}` → `{to_tag}`",
                   f"",
               ]
               if skipped:
-                  lines += [f"> ℹ️  No changes in: {', '.join(skipped)}", f""]
+                  lines += [f"> ℹ️  No changes in: {', '.join(skipped)}", ""]
 
               by_cat = defaultdict(list)
               for pr in all_prs:
                   by_cat[categorise(pr)].append(pr)
 
               for cat in sorted(CATEGORIES, key=lambda c: CATEGORIES[c][1]):
-                  if cat not in by_cat:
-                      continue
-                  label = CATEGORIES[cat][0]
-                  lines += [f"### {label}", f""]
+                  if cat not in by_cat: continue
+                  lines += [f"### {CATEGORIES[cat][0]}", ""]
                   for pr in sorted(by_cat[cat], key=lambda p: p["repo"]):
                       name = DISPLAY.get(pr["repo"], pr["repo"])
                       ref  = f"[#{pr['number']}]({pr['url']})" if pr["number"] \
                              else f"[`{pr['sha']}`]({pr['url']})"
                       lines.append(f"- **[{name}]** {pr['title']} {ref} (@{pr['author']})")
-                  lines.append(f"")
+                  lines.append("")
 
-              # Summary
-              lines += ["---", f"", "### 📊 Summary", f"",
-                        "| Repository | Changes |", "|---|---|"]
               counts = defaultdict(int)
               for pr in all_prs:
                   counts[pr["repo"]] += 1
+
+              lines += ["---", "", "### 📊 Summary", "",
+                        "| Repository | Changes |", "|---|---|"]
               for repo, n in sorted(counts.items(), key=lambda x: -x[1]):
                   nm = DISPLAY.get(repo, repo)
                   lines.append(f"| [{nm}](https://github.com/{repo}) | {n} |")
-              lines += [f"| **Total** | **{len(all_prs)}** |", f""]
-
-              lines += ["### 🔗 Module Version Changes", f"",
+              lines += [f"| **Total** | **{len(all_prs)}** |", "",
+                        "### 🔗 Module Version Changes", "",
                         "| Module | From | To |", "|---|---|---|"]
               for mod, (ov, nv) in sorted(changed.items()):
                   repo = MODULES.get(mod, mod)
                   nm   = DISPLAY.get(repo, repo)
-                  lines.append(f"| [{nm}](https://github.com/{repo}) | `{ov[:38]}` | `{nv[:38]}` |")
-              lines.append(f"")
+                  lines.append(f"| [{nm}](https://github.com/{repo}) | `{ov}` | `{nv}` |")
+              lines.append("")
               return "\n".join(lines)
 
-          # ── Main ────────────────────────────────────────────────────────────
-          print(f"🐸 Cross-Repo Release Notes  {FROM} → {TO}", flush=True)
-          print("─" * 60, flush=True)
+          # ── Main ─────────────────────────────────────────────────────────────
+          print(f"🐸 {FROM} → {TO}", flush=True)
 
-          print("\n1️⃣  Reading go.mod at both tags...", flush=True)
           old_mod = fetch_gomod(REPO, FROM)
           new_mod = fetch_gomod(REPO, TO)
           if not old_mod or not new_mod:
-              print("❌  Could not fetch go.mod — check that both tags exist")
+              print("❌  Could not fetch go.mod — check both tags exist in jfrog/jfrog-cli")
               sys.exit(1)
 
           old_v = parse_gomod(old_mod)
           new_v = parse_gomod(new_mod)
 
-          print("\n2️⃣  Detecting module changes...", flush=True)
           changed, skipped = {}, []
           for mod in sorted(set(old_v) | set(new_v)):
-              ov = old_v.get(mod, "(new)")
-              nv = new_v.get(mod, "(removed)")
+              ov, nv = old_v.get(mod, "(new)"), new_v.get(mod, "(removed)")
               if ov == nv:
                   skipped.append(DISPLAY.get(MODULES.get(mod, ""), mod))
               else:
                   changed[mod] = (ov, nv)
-                  nm = DISPLAY.get(MODULES.get(mod, mod), mod)
-                  print(f"  ✅  {nm}  {ov[:30]} → {nv[:30]}", flush=True)
-
+                  print(f"  ✅  {DISPLAY.get(MODULES.get(mod,mod),mod)}", flush=True)
           if skipped:
               print(f"  ⏭️   No change: {', '.join(skipped)}", flush=True)
 
-          print("\n3️⃣  Collecting PRs...", flush=True)
           all_prs = []
-
-          # Main repo
           old_sha = resolve_sha(REPO, FROM, "tag")
           new_sha = resolve_sha(REPO, TO,   "tag")
           all_prs.extend(prs_between(REPO, old_sha, new_sha, "sha", "sha"))
 
-          # Downstream repos
           for mod, (ov, nv) in changed.items():
               repo = MODULES.get(mod)
-              if not repo:
-                  print(f"  ⚠  No repo mapping for {mod} — skipping", flush=True)
-                  continue
+              if not repo: continue
               oh, ot = extract_hash(ov)
               nh, nt = extract_hash(nv)
-              print(f"\n  [{repo}]", flush=True)
-              print(f"    old version : {ov}", flush=True)
-              print(f"    new version : {nv}", flush=True)
-              print(f"    old hash    : {oh}  (type={ot})", flush=True)
-              print(f"    new hash    : {nh}  (type={nt})", flush=True)
-              if not oh or not nh:
-                  print(f"    ⚠  Could not extract hashes — skipping", flush=True)
-                  continue
-              all_prs.extend(prs_between(repo, oh, nh, ot, nt))
+              if oh and nh:
+                  all_prs.extend(prs_between(repo, oh, nh, ot, nt))
+              else:
+                  print(f"  ⚠  Skipping {repo} — could not extract hash from {ov}", flush=True)
 
-          print(f"\n4️⃣  Rendering changelog ({len(all_prs)} items)...", flush=True)
           md = render(FROM, TO, all_prs, changed, skipped)
-
           with open("/tmp/RELEASE_NOTES.md", "w") as f:
               f.write(md)
 
           print(md, flush=True)
-          print(f"\n✅  Done — {len(all_prs)} items across {len(changed)+1} repos")
+          print(f"\n✅  {len(all_prs)} items across {len(changed)+1} repos", flush=True)
           PYEOF
 
-      # ── DEBUG: Test jfrog-cli-artifactory compare directly ───────────────
-      - name: Debug — test artifactory PR fetch directly
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 << 'EOF'
-          import os, json, base64
-          from urllib.request import urlopen, Request
-          from urllib.error import HTTPError
-
-          TOKEN = os.environ["GITHUB_TOKEN"]
-          REPO  = "jfrog/jfrog-cli-artifactory"
-          OLD   = "b6523f01f9c7"
-          NEW   = "ad6064f2f373"
-
-          def api(url):
-              req = Request(url, headers={
-                  "Authorization": f"Bearer {TOKEN}",
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              })
-              try:
-                  with urlopen(req) as r:
-                      return json.loads(r.read()), r.status
-              except HTTPError as e:
-                  return None, e.code
-
-          # Step 1: test compare endpoint
-          print(f"Testing compare: {OLD}...{NEW}")
-          data, status = api(f"https://api.github.com/repos/{REPO}/compare/{OLD}...{NEW}")
-          print(f"  Status: {status}")
-          if data:
-              commits = data.get("commits", [])
-              print(f"  Commits found: {len(commits)}")
-              for c in commits[:5]:
-                  sha  = c["sha"][:12]
-                  msg  = c["commit"]["message"].split("\n")[0]
-                  print(f"    {sha}  {msg}")
-
-              # Step 2: test PR lookup for first commit
-              if commits:
-                  first_sha = commits[0]["sha"]
-                  print(f"\nTesting PR lookup for commit {first_sha[:12]}...")
-                  prs, status2 = api(f"https://api.github.com/repos/{REPO}/commits/{first_sha}/pulls")
-                  print(f"  Status: {status2}")
-                  print(f"  PRs found: {len(prs) if prs else 0}")
-                  if prs:
-                      for pr in prs[:3]:
-                          print(f"    #{pr['number']} {pr['title']}")
-          else:
-              print("  ❌ Compare API returned nothing — possible permissions issue or bad hash")
-          EOF
-
-
-      - name: Run aggregator
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FROM_TAG: ${{ steps.tags.outputs.from }}
-          TO_TAG:   ${{ steps.tags.outputs.to }}
-          MAIN_REPO: "jfrog/jfrog-cli"   # always read from upstream, not the fork
-        run: python /tmp/aggregate.py
-
-      # ── 6. Upload notes as workflow artifact (always) ─────────────────────
       - name: Upload release notes artifact
         uses: actions/upload-artifact@v4
         with:
@@ -497,79 +373,37 @@ jobs:
           path: /tmp/RELEASE_NOTES.md
           retention-days: 365
 
-      # ── 7. Rewrite the GitHub Release body ────────────────────────────────
       - name: Update GitHub Release body
         if: |
           github.event_name == 'release' ||
           (github.event_name == 'workflow_dispatch' && inputs.update_release_body == true)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TO="${{ steps.tags.outputs.to }}"
-
-          # When testing from a fork, releases live on the upstream repo.
-          # On the real jfrog/jfrog-cli repo, github.repository is correct.
-          # During fork testing, point at upstream so we can verify the update works.
-          TARGET_REPO="jfrog/jfrog-cli"
-          # Uncomment the line below when workflow runs IN the real repo:
-          # TARGET_REPO="${{ github.repository }}"
-
-          echo "Looking up release for tag ${TO} in ${TARGET_REPO}..."
-          RESPONSE=$(gh api "repos/${TARGET_REPO}/releases/tags/${TO}" 2>&1 || true)
-          RELEASE_ID=$(echo "$RESPONSE" | python3 -c "
-          import sys, json
-          try:
-              d = json.load(sys.stdin)
-              if 'id' in d:
-                  print(d['id'])
-              else:
-                  print('')
-          except:
-              print('')
-          ")
+          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${TO}" \
+            --jq '.id' 2>/dev/null || echo "")
 
           if [ -z "$RELEASE_ID" ]; then
-            echo "⚠️  No GitHub Release found for tag ${TO} in ${TARGET_REPO}"
-            echo "   This is expected when testing from a fork that has no releases."
-            echo "   The generated notes are available as a workflow artifact instead."
-            echo "   When merged to jfrog/jfrog-cli, the release body will auto-update."
+            echo "⚠️  No release found for ${TO} in ${{ github.repository }} — skipping body update"
             exit 0
           fi
 
-          echo "Found release ID: ${RELEASE_ID} — updating body..."
-          NOTES=$(cat /tmp/RELEASE_NOTES.md)
+          gh api --method PATCH \
+            "repos/${{ github.repository }}/releases/${RELEASE_ID}" \
+            --field body="$(cat /tmp/RELEASE_NOTES.md)"
 
-          UPDATE_RESPONSE=$(gh api \
-            --method PATCH \
-            "repos/${TARGET_REPO}/releases/${RELEASE_ID}" \
-            --field body="${NOTES}" 2>&1) && \
-          echo "✅  Release body updated for ${TO} in ${TARGET_REPO}" || \
-          {
-            echo "⚠️  Could not update release body — HTTP error below:"
-            echo "$UPDATE_RESPONSE"
-            echo ""
-            echo "   If you are testing from a fork this is expected — your GITHUB_TOKEN"
-            echo "   does not have write access to ${TARGET_REPO}."
-            echo "   The generated notes are saved as a workflow artifact."
-            echo "   When this workflow runs inside jfrog/jfrog-cli itself the update will work."
-            exit 0
-          }
+          echo "✅  Release body updated for ${TO}"
 
-      # ── 8. Job summary ────────────────────────────────────────────────────
       - name: Write job summary
         if: always()
         run: |
           echo "## 🐸 Cross-Repo Release Notes" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| From | \`${{ steps.tags.outputs.from }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| To   | \`${{ steps.tags.outputs.to }}\` |"   >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f /tmp/RELEASE_NOTES.md ]; then
-            echo "### Preview (first 60 lines)" >> $GITHUB_STEP_SUMMARY
-            head -60 /tmp/RELEASE_NOTES.md >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "_Full notes saved as workflow artifact_" >> $GITHUB_STEP_SUMMARY
+            head -40 /tmp/RELEASE_NOTES.md >> $GITHUB_STEP_SUMMARY
           fi
