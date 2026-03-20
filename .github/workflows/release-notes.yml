@@ -195,24 +195,36 @@ jobs:
               vers = {}
               in_req = False
               for line in text.splitlines():
+                  # Strip ALL whitespace including tabs — go.mod uses tabs for indentation
                   s = line.strip()
+                  if not s or s.startswith("//"):
+                      continue
                   if s.startswith("require ("):
                       in_req = True; continue
                   if in_req and s == ")":
                       in_req = False; continue
                   if in_req or s.startswith("require "):
-                      s = s.replace("require ", "").split("//")[0].strip()
+                      s = s.replace("require ", "").strip()
+                      # Remove inline comments
+                      s = s.split("//")[0].strip()
                       parts = s.split()
-                      if len(parts) >= 2 and parts[0] in MODULES:
-                          vers[parts[0]] = parts[1]
+                      if len(parts) >= 2:
+                          mod_path = parts[0].strip()
+                          version  = parts[1].strip()
+                          if mod_path in MODULES:
+                              vers[mod_path] = version
               return vers
 
           def extract_hash(version):
+              # Strip all whitespace, tabs, newlines before matching
+              version = version.strip()
               m = PSEUDO_RE.search(version)
               if m:
                   return m.group(1), "pseudo"
               if SEMVER_RE.match(version):
                   return version, "tag"
+              # Debug: print repr so we can see hidden chars
+              print(f"    ⚠  extract_hash failed on: {repr(version)}", flush=True)
               return None, "unknown"
 
           def resolve_sha(repo, ref, ref_type):
