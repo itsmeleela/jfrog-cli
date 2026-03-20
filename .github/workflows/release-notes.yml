@@ -409,7 +409,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FROM_TAG: ${{ steps.tags.outputs.from }}
           TO_TAG:   ${{ steps.tags.outputs.to }}
-          MAIN_REPO: ${{ github.repository }}
+          MAIN_REPO: "jfrog/jfrog-cli"   # always read from upstream, not the fork
         run: python /tmp/aggregate.py
 
       # ── 6. Upload notes as workflow artifact (always) ─────────────────────
