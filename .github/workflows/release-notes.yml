@@ -216,14 +216,18 @@ jobs:
               return vers
 
           def extract_hash(version):
-              # Strip all whitespace, tabs, newlines before matching
               version = version.strip()
-              m = PSEUDO_RE.search(version)
-              if m:
-                  return m.group(1), "pseudo"
+              # Regular semver tag like v1.26.2 — use as git tag directly
               if SEMVER_RE.match(version):
                   return version, "tag"
-              # Debug: print repr so we can see hidden chars
+              # Go pseudo-version: vX.Y.Z-0.YYYYMMDDHHMMSS-COMMITHASH
+              # Split on '-' and take the last segment as the commit hash
+              parts = version.split("-")
+              if len(parts) >= 3:
+                  candidate = parts[-1]
+                  # Validate it looks like a hex hash (7-40 chars)
+                  if all(c in "0123456789abcdef" for c in candidate) and 7 <= len(candidate) <= 40:
+                      return candidate, "pseudo"
               print(f"    ⚠  extract_hash failed on: {repr(version)}", flush=True)
               return None, "unknown"
 
