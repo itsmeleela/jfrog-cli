@@ -508,24 +508,44 @@ jobs:
         run: |
           TO="${{ steps.tags.outputs.to }}"
 
-          # Get release ID for this tag
-          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/${TO} --jq '.id' 2>/dev/null || echo "")
+          # When testing from a fork, releases live on the upstream repo.
+          # On the real jfrog/jfrog-cli repo, github.repository is correct.
+          # During fork testing, point at upstream so we can verify the update works.
+          TARGET_REPO="jfrog/jfrog-cli"
+          # Uncomment the line below when workflow runs IN the real repo:
+          # TARGET_REPO="${{ github.repository }}"
+
+          echo "Looking up release for tag ${TO} in ${TARGET_REPO}..."
+          RESPONSE=$(gh api "repos/${TARGET_REPO}/releases/tags/${TO}" 2>&1 || true)
+          RELEASE_ID=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              if 'id' in d:
+                  print(d['id'])
+              else:
+                  print('')
+          except:
+              print('')
+          ")
 
           if [ -z "$RELEASE_ID" ]; then
-            echo "⚠️  No GitHub Release found for tag ${TO} — skipping body update"
-            echo "    (Release may not be published yet in manual runs)"
+            echo "⚠️  No GitHub Release found for tag ${TO} in ${TARGET_REPO}"
+            echo "   This is expected when testing from a fork that has no releases."
+            echo "   The generated notes are available as a workflow artifact instead."
+            echo "   When merged to jfrog/jfrog-cli, the release body will auto-update."
             exit 0
           fi
 
+          echo "Found release ID: ${RELEASE_ID} — updating body..."
           NOTES=$(cat /tmp/RELEASE_NOTES.md)
-          echo "Updating release ${RELEASE_ID} (${TO})..."
 
           gh api \
             --method PATCH \
-            "repos/${{ github.repository }}/releases/${RELEASE_ID}" \
+            "repos/${TARGET_REPO}/releases/${RELEASE_ID}" \
             --field body="${NOTES}"
 
-          echo "✅  Release body updated for ${TO}"
+          echo "✅  Release body updated for ${TO} in ${TARGET_REPO}"
 
       # ── 8. Job summary ────────────────────────────────────────────────────
       - name: Write job summary
