@@ -540,12 +540,21 @@ jobs:
           echo "Found release ID: ${RELEASE_ID} — updating body..."
           NOTES=$(cat /tmp/RELEASE_NOTES.md)
 
-          gh api \
+          UPDATE_RESPONSE=$(gh api \
             --method PATCH \
             "repos/${TARGET_REPO}/releases/${RELEASE_ID}" \
-            --field body="${NOTES}"
-
-          echo "✅  Release body updated for ${TO} in ${TARGET_REPO}"
+            --field body="${NOTES}" 2>&1) && \
+          echo "✅  Release body updated for ${TO} in ${TARGET_REPO}" || \
+          {
+            echo "⚠️  Could not update release body — HTTP error below:"
+            echo "$UPDATE_RESPONSE"
+            echo ""
+            echo "   If you are testing from a fork this is expected — your GITHUB_TOKEN"
+            echo "   does not have write access to ${TARGET_REPO}."
+            echo "   The generated notes are saved as a workflow artifact."
+            echo "   When this workflow runs inside jfrog/jfrog-cli itself the update will work."
+            exit 0
+          }
 
       # ── 8. Job summary ────────────────────────────────────────────────────
       - name: Write job summary
