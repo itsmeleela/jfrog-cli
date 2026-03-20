@@ -138,7 +138,7 @@ jobs:
               "other":    ("📦 Other Changes",       7),
           }
 
-          PSEUDO_RE = re.compile(r"v\d+\.\d+\.\d+-\d{14}-([0-9a-f]{12})")
+          PSEUDO_RE = re.compile(r"v\d+\.\d+\.\d+-\d{14}-([0-9a-f]{7,40})")
           SEMVER_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 
           # ── GitHub API (stdlib urllib — zero dependencies) ──────────────────
@@ -387,11 +387,19 @@ jobs:
           for mod, (ov, nv) in changed.items():
               repo = MODULES.get(mod)
               if not repo:
+                  print(f"  ⚠  No repo mapping for {mod} — skipping", flush=True)
                   continue
               oh, ot = extract_hash(ov)
               nh, nt = extract_hash(nv)
-              if oh and nh:
-                  all_prs.extend(prs_between(repo, oh, nh, ot, nt))
+              print(f"\n  [{repo}]", flush=True)
+              print(f"    old version : {ov}", flush=True)
+              print(f"    new version : {nv}", flush=True)
+              print(f"    old hash    : {oh}  (type={ot})", flush=True)
+              print(f"    new hash    : {nh}  (type={nt})", flush=True)
+              if not oh or not nh:
+                  print(f"    ⚠  Could not extract hashes — skipping", flush=True)
+                  continue
+              all_prs.extend(prs_between(repo, oh, nh, ot, nt))
 
           print(f"\n4️⃣  Rendering changelog ({len(all_prs)} items)...", flush=True)
           md = render(FROM, TO, all_prs, changed, skipped)
