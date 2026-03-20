@@ -381,11 +381,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TO="${{ steps.tags.outputs.to }}"
+
           RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${TO}" \
-            --jq '.id' 2>/dev/null || echo "")
+            --jq '.id // empty' 2>/dev/null || echo "")
 
           if [ -z "$RELEASE_ID" ]; then
-            echo "⚠️  No release found for ${TO} in ${{ github.repository }} — skipping body update"
+            echo "⚠️  No release found for ${TO} in ${{ github.repository }}"
+            echo "    Create a release on this tag first, or this workflow is running from a fork."
+            echo "    Notes are available as a workflow artifact."
             exit 0
           fi
 
